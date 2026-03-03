@@ -146,6 +146,8 @@ class Etudiant(Base):
     ufr_id = Column(String, ForeignKey("ufrs.id", ondelete="CASCADE"), nullable=False, index=True)
     filiere_id = Column(String, ForeignKey("filieres.id", ondelete="CASCADE"), nullable=False, index=True)
     statut_passage = Column(String(20), nullable=True)  # null, 'en_attente', 'validé', 'redoublant'
+    subscription_active = Column(Boolean, default=False, nullable=False)
+    subscription_expires = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relations
@@ -153,6 +155,7 @@ class Etudiant(Base):
     ufr = relationship("UFR", back_populates="etudiants")
     filiere = relationship("Filiere", back_populates="etudiants")
     passages = relationship("StudentPassage", back_populates="etudiant", cascade="all, delete-orphan")
+    payment_requests = relationship("PaymentRequest", back_populates="etudiant", cascade="all, delete-orphan")
 
 class Content(Base):
     __tablename__ = "contents"
@@ -410,3 +413,17 @@ class ScheduledCourse(Base):
         Index('idx_scheduled_course_prof', 'prof_id', 'cours_date'),
         Index('idx_scheduled_course_filiere', 'filiere_id', 'niveau', 'semestre'),
     )
+
+
+class PaymentRequest(Base):
+    __tablename__ = "payment_requests"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    student_id = Column(Integer, ForeignKey("etudiants.id", ondelete="CASCADE"), nullable=False, index=True)
+    payment_method = Column(String(20), nullable=False)  # orange / wave
+    amount = Column(Integer, default=1000, nullable=False)
+    proof_image_path = Column(String(500), nullable=False)
+    status = Column(String(20), default="pending", nullable=False)  # pending / approved / rejected
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    etudiant = relationship("Etudiant", back_populates="payment_requests")

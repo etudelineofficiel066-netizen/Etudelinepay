@@ -1680,6 +1680,10 @@
                 <button onclick="showTab('filiere')" id="tab-filiere" class="tab-btn">📚 Filières</button>
                 <button onclick="showTab('matiere')" id="tab-matiere" class="tab-btn">📖 Matières</button>
                 <button onclick="showTab('passage')" id="tab-passage" class="tab-btn">🎓 Hiérarchie de passage</button>
+                <button onclick="showTab('paiements'); loadPayments()" id="tab-paiements" class="tab-btn" style="position:relative;">
+                    💳 Paiements
+                    <span id="badge-paiements" style="display:none; position:absolute; top:-6px; right:-6px; background:#ef4444; color:white; border-radius:50%; width:18px; height:18px; font-size:11px; line-height:18px; text-align:center; font-weight:700;"></span>
+                </button>
             </div>
         </div>
 
@@ -4420,6 +4424,207 @@
         window.setupAdminFormAjax = setupAdminFormAjax;
     </script>
     
+    <!-- ===== ONGLET PAIEMENTS ===== -->
+    <div id="content-paiements" class="tab-content">
+        <div class="card">
+            <h3 style="color:#7C3AED; margin-bottom:1.5rem;">💳 Demandes de paiement d'abonnement</h3>
+
+            <!-- Filtres rapides -->
+            <div style="display:flex; gap:0.75rem; flex-wrap:wrap; margin-bottom:1.5rem;">
+                <button onclick="filterPayments('all')" id="filter-all" class="tab-btn active" style="font-size:0.85rem; padding:0.4rem 1rem;">Toutes</button>
+                <button onclick="filterPayments('pending')" id="filter-pending" class="tab-btn" style="font-size:0.85rem; padding:0.4rem 1rem;">🟡 En attente</button>
+                <button onclick="filterPayments('approved')" id="filter-approved" class="tab-btn" style="font-size:0.85rem; padding:0.4rem 1rem;">🟢 Validées</button>
+                <button onclick="filterPayments('rejected')" id="filter-rejected" class="tab-btn" style="font-size:0.85rem; padding:0.4rem 1rem;">🔴 Refusées</button>
+            </div>
+
+            <div id="payments-loading" style="text-align:center; padding:2rem; color:#666;">
+                Chargement des demandes...
+            </div>
+            <div id="payments-list" style="display:none;">
+                <div id="payments-empty" style="display:none; text-align:center; padding:2rem; color:#888;">
+                    Aucune demande de paiement.
+                </div>
+                <div id="payments-table-wrapper" style="overflow-x:auto;">
+                    <table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
+                        <thead>
+                            <tr style="background:#f3f4f6; border-bottom:2px solid #e5e7eb;">
+                                <th style="padding:0.75rem; text-align:left;">#</th>
+                                <th style="padding:0.75rem; text-align:left;">Étudiant</th>
+                                <th style="padding:0.75rem; text-align:left;">Méthode</th>
+                                <th style="padding:0.75rem; text-align:left;">Montant</th>
+                                <th style="padding:0.75rem; text-align:left;">Statut</th>
+                                <th style="padding:0.75rem; text-align:left;">Date</th>
+                                <th style="padding:0.75rem; text-align:left;">Preuve</th>
+                                <th style="padding:0.75rem; text-align:left;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="payments-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal preuve image -->
+    <div id="modal-proof" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:9999; align-items:center; justify-content:center;">
+        <div style="background:white; border-radius:12px; padding:1.5rem; max-width:90vw; max-height:90vh; overflow:auto; position:relative;">
+            <button onclick="document.getElementById('modal-proof').style.display='none'" style="position:absolute; top:10px; right:14px; background:none; border:none; font-size:1.5rem; cursor:pointer; color:#333;">✕</button>
+            <img id="modal-proof-img" src="" alt="Preuve de paiement" style="max-width:80vw; max-height:80vh; border-radius:8px;">
+        </div>
+    </div>
+
+    <script>
+        let allPayments = [];
+        let currentFilter = 'all';
+
+        async function loadPayments() {
+            document.getElementById('payments-loading').style.display = 'block';
+            document.getElementById('payments-list').style.display = 'none';
+            try {
+                const resp = await fetch('/admin/payments');
+                allPayments = await resp.json();
+                renderPayments();
+                // Badge
+                const pending = allPayments.filter(p => p.status === 'pending').length;
+                const badge = document.getElementById('badge-paiements');
+                if (pending > 0) {
+                    badge.textContent = pending;
+                    badge.style.display = 'inline-block';
+                } else {
+                    badge.style.display = 'none';
+                }
+            } catch(e) {
+                document.getElementById('payments-loading').innerHTML = '<span style="color:red">Erreur de chargement.</span>';
+            }
+        }
+
+        function filterPayments(status) {
+            currentFilter = status;
+            document.querySelectorAll('[id^="filter-"]').forEach(b => b.classList.remove('active'));
+            document.getElementById('filter-' + status).classList.add('active');
+            renderPayments();
+        }
+
+        function renderPayments() {
+            document.getElementById('payments-loading').style.display = 'none';
+            document.getElementById('payments-list').style.display = 'block';
+
+            const filtered = currentFilter === 'all' ? allPayments : allPayments.filter(p => p.status === currentFilter);
+            const tbody = document.getElementById('payments-tbody');
+            tbody.innerHTML = '';
+
+            if (filtered.length === 0) {
+                document.getElementById('payments-empty').style.display = 'block';
+                document.getElementById('payments-table-wrapper').style.display = 'none';
+                return;
+            }
+            document.getElementById('payments-empty').style.display = 'none';
+            document.getElementById('payments-table-wrapper').style.display = 'block';
+
+            const statusLabels = { pending: '🟡 En attente', approved: '🟢 Validé', rejected: '🔴 Refusé' };
+            const methodLabels = { orange: '🟠 Orange Money', wave: '🔵 Wave' };
+
+            filtered.forEach(p => {
+                const date = p.created_at ? new Date(p.created_at).toLocaleDateString('fr-FR') : '-';
+                const tr = document.createElement('tr');
+                tr.style.borderBottom = '1px solid #e5e7eb';
+                tr.innerHTML = `
+                    <td style="padding:0.75rem; color:#666;">${p.id}</td>
+                    <td style="padding:0.75rem; font-weight:600;">${p.student_name}<br><small style="color:#888;">${p.student_username}</small></td>
+                    <td style="padding:0.75rem;">${methodLabels[p.payment_method] || p.payment_method}</td>
+                    <td style="padding:0.75rem; font-weight:600;">${p.amount} FCFA</td>
+                    <td style="padding:0.75rem;">${statusLabels[p.status] || p.status}</td>
+                    <td style="padding:0.75rem; color:#666;">${date}</td>
+                    <td style="padding:0.75rem;">
+                        <button onclick="viewProof(${p.id})" style="background:#6366f1; color:white; border:none; padding:0.3rem 0.75rem; border-radius:6px; cursor:pointer; font-size:0.8rem;">
+                            🖼️ Voir
+                        </button>
+                    </td>
+                    <td style="padding:0.75rem;">
+                        ${p.status === 'pending' ? `
+                        <div style="display:flex; gap:0.5rem;">
+                            <button onclick="approvePayment(${p.id}, this)" style="background:#22c55e; color:white; border:none; padding:0.3rem 0.75rem; border-radius:6px; cursor:pointer; font-size:0.8rem; font-weight:600;">
+                                ✅ Valider
+                            </button>
+                            <button onclick="rejectPayment(${p.id}, this)" style="background:#ef4444; color:white; border:none; padding:0.3rem 0.75rem; border-radius:6px; cursor:pointer; font-size:0.8rem; font-weight:600;">
+                                ❌ Refuser
+                            </button>
+                        </div>
+                        ` : '<span style="color:#aaa; font-size:0.8rem;">—</span>'}
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function viewProof(paymentId) {
+            const img = document.getElementById('modal-proof-img');
+            img.src = `/admin/payments/${paymentId}/proof?t=` + Date.now();
+            document.getElementById('modal-proof').style.display = 'flex';
+        }
+
+        async function approvePayment(paymentId, btn) {
+            if (!confirm('Valider cet abonnement et activer l\'accès aux solutions pour 365 jours ?')) return;
+            btn.disabled = true;
+            btn.textContent = '...';
+            try {
+                const resp = await fetch(`/admin/payments/${paymentId}/approve`, { method: 'POST' });
+                const data = await resp.json();
+                if (data.success) {
+                    showToast('✅ ' + data.message, 'success');
+                    await loadPayments();
+                } else {
+                    showToast('Erreur : ' + (data.detail || 'Échec'), 'error');
+                }
+            } catch(e) {
+                showToast('Erreur réseau', 'error');
+            }
+            btn.disabled = false;
+        }
+
+        async function rejectPayment(paymentId, btn) {
+            if (!confirm('Refuser cette demande ?')) return;
+            btn.disabled = true;
+            btn.textContent = '...';
+            try {
+                const resp = await fetch(`/admin/payments/${paymentId}/reject`, { method: 'POST' });
+                const data = await resp.json();
+                if (data.success) {
+                    showToast('🔴 ' + data.message, 'info');
+                    await loadPayments();
+                } else {
+                    showToast('Erreur : ' + (data.detail || 'Échec'), 'error');
+                }
+            } catch(e) {
+                showToast('Erreur réseau', 'error');
+            }
+            btn.disabled = false;
+        }
+
+        function showToast(msg, type) {
+            const container = document.getElementById('toast-container');
+            if (!container) return;
+            const toast = document.createElement('div');
+            const colors = { success: '#22c55e', error: '#ef4444', info: '#6366f1' };
+            toast.style.cssText = `background:${colors[type]||'#333'}; color:white; padding:0.75rem 1.25rem; border-radius:8px; margin-bottom:8px; font-size:0.9rem; box-shadow:0 4px 12px rgba(0,0,0,0.15); animation: fadeIn 0.3s;`;
+            toast.textContent = msg;
+            container.appendChild(toast);
+            setTimeout(() => toast.remove(), 4000);
+        }
+
+        // Charger le badge au chargement de la page
+        window.addEventListener('DOMContentLoaded', () => {
+            fetch('/admin/payments').then(r => r.json()).then(data => {
+                const pending = data.filter(p => p.status === 'pending').length;
+                const badge = document.getElementById('badge-paiements');
+                if (badge && pending > 0) {
+                    badge.textContent = pending;
+                    badge.style.display = 'inline-block';
+                }
+            }).catch(() => {});
+        });
+    </script>
+
     <div style="text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e9ecef; color: #666; font-size: 0.9rem;">
         © 2025 Maodo Ka - Tous droits réservés | Étude LINE
     </div>

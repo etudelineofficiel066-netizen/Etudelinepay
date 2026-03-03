@@ -27,7 +27,8 @@ from models import (
     Content, ChapitreComplet as ChapitreCompletDB, Commentaire as CommentaireDB, Notification as NotificationDB,
     ParametreSysteme as ParametreSystemeDB, ParametreUniversite as ParametreUniversiteDB,
     PassageHierarchy as PassageHierarchyDB, StudentPassage as StudentPassageDB,
-    MessageProf, MessageEtudiantStatut, ScheduledCourse as ScheduledCourseDB
+    MessageProf, MessageEtudiantStatut, ScheduledCourse as ScheduledCourseDB,
+    PaymentRequest as PaymentRequestDB
 )
 
 # === CONFIGURATION STOCKAGE FICHIERS ===
@@ -382,6 +383,11 @@ def get_student_profile(db: Session, username: str) -> Optional[Dict[str, str]]:
         ufr = db.query(UFRDB).filter_by(id=etudiant.ufr_id).first()
         filiere = db.query(FiliereDB).filter_by(id=etudiant.filiere_id).first()
         
+        now = datetime.utcnow()
+        sub_active = (
+            etudiant.subscription_active and
+            (etudiant.subscription_expires is None or etudiant.subscription_expires > now)
+        )
         profile = {
             "id": etudiant.id,
             "username": etudiant.username,
@@ -390,7 +396,9 @@ def get_student_profile(db: Session, username: str) -> Optional[Dict[str, str]]:
             "niveau": etudiant.niveau,
             "universite_id": etudiant.universite_id,
             "ufr_id": etudiant.ufr_id,
-            "filiere_id": etudiant.filiere_id
+            "filiere_id": etudiant.filiere_id,
+            "subscription_active": sub_active,
+            "subscription_expires": etudiant.subscription_expires.isoformat() if etudiant.subscription_expires else None,
         }
         
         # Add names for backward compatibility
@@ -1929,7 +1937,18 @@ async def chapitre_detail_etudiant(chapitre_id: int, request: Request, db: Sessi
     commentaires = db.query(CommentaireDB).filter(
         CommentaireDB.chapitre_id == chapitre_id
     ).order_by(CommentaireDB.created_at.desc()).all()
-    
+
+    # Statut abonnement et demande de paiement en cours
+    student_id = student.get("id")
+    subscription_active = student.get("subscription_active", False)
+    pending_payment = db.query(PaymentRequestDB).filter(
+        PaymentRequestDB.student_id == student_id,
+        PaymentRequestDB.status == "pending"
+    ).first()
+    last_payment = db.query(PaymentRequestDB).filter(
+        PaymentRequestDB.student_id == student_id
+    ).order_by(PaymentRequestDB.created_at.desc()).first()
+
     return templates.TemplateResponse("chapitre_detail.html", {
         "request": request,
         "chapitre": chapitre,
@@ -1939,7 +1958,11 @@ async def chapitre_detail_etudiant(chapitre_id: int, request: Request, db: Sessi
         "commentaires": commentaires,
         "dashboard_url": "/dashboard/etudiant",
         "user_type": "etudiant",
-        "user_id": student.get("id")
+        "user_id": student_id,
+        "subscription_active": subscription_active,
+        "subscription_expires": student.get("subscription_expires"),
+        "has_pending_payment": pending_payment is not None,
+        "last_payment_status": last_payment.status if last_payment else None,
     })
 
 
@@ -1986,6 +2009,159 @@ async def poster_commentaire(chapitre_id: int, request: Request, texte: str = Fo
         return RedirectResponse(url=f"/chapitre/{chapitre_id}/prof#commentaires", status_code=303)
     else:
         return RedirectResponse(url=f"/chapitre/{chapitre_id}/etudiant#commentaires", status_code=303)
+
+
+# ============================================================
+# ROUTES PAIEMENT / ABONNEMENT PREMIUM
+# ============================================================
+
+PAYMENT_PROOF_DIR = UPLOADS_DIR / "payment_proofs"
+PAYMENT_PROOF_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+MAX_PROOF_SIZE = 5 * 1024 * 1024  # 5 MB
+
+
+@app.post("/payments/request")
+async def submit_payment_request(
+    request: Request,
+    payment_method: str = Form(...),
+    proof_image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Étudiant soumet une demande de paiement avec preuve"""
+    etudiant_username, _ = require_etudiant(request, db)
+    etudiant = db.query(EtudiantDB).filter_by(username=etudiant_username).first()
+    if not etudiant:
+        raise HTTPException(status_code=404, detail="Étudiant introuvable")
+
+    if payment_method not in ("orange", "wave"):
+        raise HTTPException(status_code=400, detail="Méthode de paiement invalide")
+
+    # Vérifier qu'il n'a pas déjà une demande en attente
+    existing = db.query(PaymentRequestDB).filter(
+        PaymentRequestDB.student_id == etudiant.id,
+        PaymentRequestDB.status == "pending",
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Vous avez déjà une demande en attente")
+
+    # Vérifier taille et type du fichier
+    content_type = proof_image.content_type or ""
+    if content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Le fichier doit être une image (JPG, PNG, WEBP, GIF)")
+
+    contents = await proof_image.read()
+    if len(contents) > MAX_PROOF_SIZE:
+        raise HTTPException(status_code=400, detail="L'image ne doit pas dépasser 5 Mo")
+
+    # Sauvegarder l'image
+    ext = proof_image.filename.rsplit(".", 1)[-1] if proof_image.filename else "jpg"
+    filename = f"proof_{etudiant.id}_{uuid.uuid4().hex}.{ext}"
+    file_path = PAYMENT_PROOF_DIR / filename
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    payment_req = PaymentRequestDB(
+        student_id=etudiant.id,
+        payment_method=payment_method,
+        amount=1000,
+        proof_image_path=str(file_path),
+        status="pending",
+    )
+    db.add(payment_req)
+    db.commit()
+
+    # Rediriger vers le dashboard avec message
+    return RedirectResponse(url="/dashboard/etudiant?payment=sent", status_code=303)
+
+
+@app.get("/admin/payments")
+async def admin_list_payments(
+    request: Request,
+    admin_data: tuple = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Lister les demandes de paiement (admin)"""
+    payments = (
+        db.query(PaymentRequestDB)
+        .order_by(PaymentRequestDB.created_at.desc())
+        .all()
+    )
+    result = []
+    for p in payments:
+        etudiant = db.query(EtudiantDB).filter_by(id=p.student_id).first()
+        result.append({
+            "id": p.id,
+            "student_id": p.student_id,
+            "student_name": f"{etudiant.prenom} {etudiant.nom}" if etudiant else "Inconnu",
+            "student_username": etudiant.username if etudiant else "",
+            "payment_method": p.payment_method,
+            "amount": p.amount,
+            "status": p.status,
+            "created_at": p.created_at.isoformat() if p.created_at else "",
+            "proof_url": f"/admin/payments/{p.id}/proof",
+        })
+    return JSONResponse(result)
+
+
+@app.get("/admin/payments/{payment_id}/proof")
+async def admin_view_proof(
+    payment_id: int,
+    request: Request,
+    admin_data: tuple = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Afficher l'image de preuve de paiement (admin)"""
+    payment = db.query(PaymentRequestDB).filter_by(id=payment_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Demande introuvable")
+    proof_path = Path(payment.proof_image_path)
+    if not proof_path.exists():
+        raise HTTPException(status_code=404, detail="Image introuvable")
+    return FileResponse(str(proof_path))
+
+
+@app.post("/admin/payments/{payment_id}/approve")
+async def admin_approve_payment(
+    payment_id: int,
+    request: Request,
+    admin_data: tuple = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Valider une demande de paiement (admin)"""
+    payment = db.query(PaymentRequestDB).filter_by(id=payment_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Demande introuvable")
+    if payment.status != "pending":
+        raise HTTPException(status_code=400, detail="Demande déjà traitée")
+
+    payment.status = "approved"
+    etudiant = db.query(EtudiantDB).filter_by(id=payment.student_id).first()
+    if etudiant:
+        etudiant.subscription_active = True
+        etudiant.subscription_expires = datetime.utcnow() + timedelta(days=365)
+    db.commit()
+    return JSONResponse({"success": True, "message": "Abonnement activé pour 365 jours"})
+
+
+@app.post("/admin/payments/{payment_id}/reject")
+async def admin_reject_payment(
+    payment_id: int,
+    request: Request,
+    admin_data: tuple = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Refuser une demande de paiement (admin)"""
+    payment = db.query(PaymentRequestDB).filter_by(id=payment_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Demande introuvable")
+    if payment.status != "pending":
+        raise HTTPException(status_code=400, detail="Demande déjà traitée")
+
+    payment.status = "rejected"
+    db.commit()
+    return JSONResponse({"success": True, "message": "Demande refusée"})
 
 
 # Admin utility endpoints
